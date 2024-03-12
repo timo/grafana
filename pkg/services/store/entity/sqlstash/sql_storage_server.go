@@ -93,7 +93,12 @@ func (s *sqlEntityServer) Init() error {
 	return nil
 }
 
-func (s *sqlEntityServer) getReadFields(r *entity.ReadEntityRequest) []string {
+type FieldSelectRequest interface {
+	GetWithBody() bool
+	GetWithStatus() bool
+}
+
+func (s *sqlEntityServer) getReadFields(r FieldSelectRequest) []string {
 	fields := []string{
 		"guid",
 		"key",
@@ -108,17 +113,17 @@ func (s *sqlEntityServer) getReadFields(r *entity.ReadEntityRequest) []string {
 		"action",
 	}
 
-	if r.WithBody {
+	if r.GetWithBody() {
 		fields = append(fields, `body`)
 	}
-	if r.WithStatus {
+	if r.GetWithStatus() {
 		fields = append(fields, "status")
 	}
 
 	return fields
 }
 
-func (s *sqlEntityServer) getReadSelect(r *entity.ReadEntityRequest) (string, error) {
+func (s *sqlEntityServer) getReadSelect(r FieldSelectRequest) (string, error) {
 	if err := s.Init(); err != nil {
 		return "", err
 	}
@@ -132,7 +137,7 @@ func (s *sqlEntityServer) getReadSelect(r *entity.ReadEntityRequest) (string, er
 	return "SELECT " + strings.Join(quotedFields, ","), nil
 }
 
-func (s *sqlEntityServer) rowToEntity(ctx context.Context, rows *sql.Rows, r *entity.ReadEntityRequest) (*entity.Entity, error) {
+func (s *sqlEntityServer) rowToEntity(ctx context.Context, rows *sql.Rows, r FieldSelectRequest) (*entity.Entity, error) {
 	raw := &entity.Entity{
 		Origin: &entity.EntityOriginInfo{},
 	}
@@ -154,10 +159,10 @@ func (s *sqlEntityServer) rowToEntity(ctx context.Context, rows *sql.Rows, r *en
 		&raw.Message,
 		&raw.Action,
 	}
-	if r.WithBody {
+	if r.GetWithBody() {
 		args = append(args, &raw.Body)
 	}
-	if r.WithStatus {
+	if r.GetWithStatus() {
 		args = append(args, &raw.Status)
 	}
 
@@ -818,6 +823,17 @@ func (s *sqlEntityServer) doDelete(ctx context.Context, tx *session.SessionTx, e
 	// Update resource version
 	ent.ResourceVersion = s.snowflake.Generate().Int64()
 
+	// Set updated at/by
+	ent.UpdatedAt = time.Now().UnixMilli()
+	modifier, err := appcontext.User(ctx)
+	if err != nil {
+		return err
+	}
+	if modifier == nil {
+		return fmt.Errorf("can not find user in context")
+	}
+	ent.UpdatedBy = store.GetUserIDString(modifier)
+
 	labels, err := json.Marshal(ent.Labels)
 	if err != nil {
 		s.log.Error("error marshalling labels", "msg", err.Error())
@@ -909,22 +925,6 @@ func (s *sqlEntityServer) History(ctx context.Context, r *entity.EntityHistoryRe
 		return nil, err
 	}
 
-	var limit int64 = 100
-	if r.Limit > 0 && r.Limit < 100 {
-		limit = r.Limit
-	}
-
-	rr := &entity.ReadEntityRequest{
-		Key:        r.Key,
-		WithBody:   true,
-		WithStatus: true,
-	}
-
-	query, err := s.getReadSelect(rr)
-	if err != nil {
-		return nil, err
-	}
-
 	if r.Key == "" {
 		return nil, fmt.Errorf("missing key")
 	}
@@ -934,25 +934,57 @@ func (s *sqlEntityServer) History(ctx context.Context, r *entity.EntityHistoryRe
 		return nil, err
 	}
 
-	where := []string{}
-	args := []any{}
-
-	where = append(where, s.dialect.Quote("namespace")+"=?", s.dialect.Quote("group")+"=?", s.dialect.Quote("resource")+"=?", s.dialect.Quote("name")+"=?")
-	args = append(args, key.Namespace, key.Group, key.Resource, key.Name)
-
-	if r.NextPageToken != "" {
-		if true {
-			return nil, fmt.Errorf("tokens not yet supported")
-		}
-		where = append(where, "version <= ?")
-		args = append(args, r.NextPageToken)
+	if key.Name == "" {
+		return nil, fmt.Errorf("missing name")
 	}
 
-	query += " FROM entity_history" +
-		" WHERE " + strings.Join(where, " AND ") +
-		" ORDER BY resource_version DESC" +
-		// select 1 more than we need to see if there is a next page
-		" LIMIT " + fmt.Sprint(limit+1)
+	var limit int64 = 100
+	if r.Limit > 0 && r.Limit < 100 {
+		limit = r.Limit
+	}
+
+	fields := s.getReadFields(r)
+
+	entityQuery := selectQuery{
+		dialect:  s.dialect,
+		fields:   fields,
+		from:     "entity_history", // the table
+		args:     []any{},
+		limit:    r.Limit,
+		offset:   0,
+		oneExtra: true, // request one more than the limit (and show next token if it exists)
+	}
+
+	args := []any{key.Group, key.Resource}
+	whereclause := "(" + s.dialect.Quote("group") + "=? AND " + s.dialect.Quote("resource") + "=?"
+	if key.Namespace != "" {
+		args = append(args, key.Namespace)
+		whereclause += " AND " + s.dialect.Quote("namespace") + "=?"
+	}
+	args = append(args, key.Name)
+	whereclause += " AND " + s.dialect.Quote("name") + "=?)"
+
+	entityQuery.addWhere(whereclause, args...)
+
+	// if we have a page token, use that to specify the first record
+	continueToken, err := GetContinueToken(r)
+	if err != nil {
+		return nil, err
+	}
+	if continueToken != nil {
+		entityQuery.offset = continueToken.StartOffset
+	}
+
+	for _, sort := range r.Sort {
+		sortBy, err := ParseSortBy(sort)
+		if err != nil {
+			return nil, err
+		}
+		entityQuery.addOrderBy(sortBy.Field, sortBy.Direction)
+	}
+	entityQuery.addOrderBy("resource_version", Descending)
+
+	query, args := entityQuery.toQuery()
 
 	rows, err := s.sess.Query(ctx, query, args...)
 	if err != nil {
@@ -961,23 +993,33 @@ func (s *sqlEntityServer) History(ctx context.Context, r *entity.EntityHistoryRe
 	defer func() { _ = rows.Close() }()
 
 	rsp := &entity.EntityHistoryResponse{
-		Key: r.Key,
+		Key:             r.Key,
+		ResourceVersion: s.snowflake.Generate().Int64(),
 	}
 	for rows.Next() {
-		v, err := s.rowToEntity(ctx, rows, rr)
+		v, err := s.rowToEntity(ctx, rows, r)
 		if err != nil {
 			return nil, err
 		}
 
 		// found more than requested
 		if int64(len(rsp.Versions)) >= limit {
-			rsp.NextPageToken = fmt.Sprintf("rv:%d", v.ResourceVersion)
+			continueToken := &ContinueToken{
+				Sort:        r.Sort,
+				StartOffset: entityQuery.offset + entityQuery.limit,
+			}
+			rsp.NextPageToken = continueToken.String()
 			break
 		}
 
 		rsp.Versions = append(rsp.Versions, v)
 	}
 	return rsp, err
+}
+
+type ContinueRequest interface {
+	GetNextPageToken() string
+	GetSort() []string
 }
 
 type ContinueToken struct {
@@ -990,12 +1032,12 @@ func (c *ContinueToken) String() string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-func GetContinueToken(r *entity.EntityListRequest) (*ContinueToken, error) {
-	if r.NextPageToken == "" {
+func GetContinueToken(r ContinueRequest) (*ContinueToken, error) {
+	if r.GetNextPageToken() == "" {
 		return nil, nil
 	}
 
-	continueVal, err := base64.StdEncoding.DecodeString(r.NextPageToken)
+	continueVal, err := base64.StdEncoding.DecodeString(r.GetNextPageToken())
 	if err != nil {
 		return nil, fmt.Errorf("error decoding continue token")
 	}
@@ -1006,7 +1048,7 @@ func GetContinueToken(r *entity.EntityListRequest) (*ContinueToken, error) {
 		return nil, err
 	}
 
-	if !slices.Equal(t.Sort, r.Sort) {
+	if !slices.Equal(t.Sort, r.GetSort()) {
 		return nil, fmt.Errorf("sort order changed")
 	}
 
@@ -1062,12 +1104,7 @@ func (s *sqlEntityServer) List(ctx context.Context, r *entity.EntityListRequest)
 		return nil, fmt.Errorf("missing user in context")
 	}
 
-	rr := &entity.ReadEntityRequest{
-		WithBody:   r.WithBody,
-		WithStatus: r.WithStatus,
-	}
-
-	fields := s.getReadFields(rr)
+	fields := s.getReadFields(r)
 
 	entityQuery := selectQuery{
 		dialect:  s.dialect,
@@ -1141,7 +1178,7 @@ func (s *sqlEntityServer) List(ctx context.Context, r *entity.EntityListRequest)
 		// if we are looking for deleted entities, we need to use the labels column
 		if r.Deleted {
 			for labelKey, labelValue := range r.Labels {
-				entityQuery.addWhere(s.dialect.Quote("labels")+" LIKE ?", "%\""+labelKey+"\":\""+labelValue+"\"%")
+				entityQuery.addWhere(s.dialect.Quote("labels")+" LIKE ?", `%"`+labelKey+`":"`+labelValue+`"%`)
 			}
 			// for active entities, we can use the entity_labels table
 		} else {
@@ -1183,7 +1220,7 @@ func (s *sqlEntityServer) List(ctx context.Context, r *entity.EntityListRequest)
 		ResourceVersion: s.snowflake.Generate().Int64(),
 	}
 	for rows.Next() {
-		result, err := s.rowToEntity(ctx, rows, rr)
+		result, err := s.rowToEntity(ctx, rows, r)
 		if err != nil {
 			return rsp, err
 		}
@@ -1235,12 +1272,7 @@ func (s *sqlEntityServer) Watch(r *entity.EntityWatchRequest, w entity.EntitySto
 
 // watchInit is a helper function to send the initial set of entities to the client
 func (s *sqlEntityServer) watchInit(ctx context.Context, r *entity.EntityWatchRequest, w entity.EntityStore_WatchServer) error {
-	rr := &entity.ReadEntityRequest{
-		WithBody:   r.WithBody,
-		WithStatus: r.WithStatus,
-	}
-
-	fields := s.getReadFields(rr)
+	fields := s.getReadFields(r)
 
 	entityQuery := selectQuery{
 		dialect:  s.dialect,
@@ -1340,7 +1372,7 @@ func (s *sqlEntityServer) watchInit(ctx context.Context, r *entity.EntityWatchRe
 					return nil
 				}
 
-				result, err := s.rowToEntity(ctx, rows, rr)
+				result, err := s.rowToEntity(ctx, rows, r)
 				if err != nil {
 					return err
 				}
