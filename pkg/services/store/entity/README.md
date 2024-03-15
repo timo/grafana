@@ -129,6 +129,13 @@ NAME                                   TITLE                              INTERV
 u394j4d3-s63j-2d74-g8hf-958773jtybf2   Playlist with auto generated UID   5m         2023-12-14T13:53:35Z 
 ```
 
+To update the playlist, update the `playlist-generate.yaml` file then run:
+```sh
+kubectl --kubeconfig=./grafana.kubeconfig patch playlist <NAME> --patch-file playlist-generate.yaml
+```
+
+In the example, `<NAME>` would be `u394j4d3-s63j-2d74-g8hf-958773jtybf2`.
+
 ### Use a separate database
 
 By default Unified Storage uses the Grafana database. To run against a separate database, update `custom.ini` by adding the following section to it:
