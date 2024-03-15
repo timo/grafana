@@ -588,7 +588,7 @@ export const applyOptionsToFrames = (frames: DataFrame[], options: NodeGraphOpti
       }
       if (options?.nodes?.arcs?.length) {
         for (const arc of options.nodes.arcs) {
-          const field = frame.fields.find((field) => field.name.toLowerCase() === arc.field);
+          const field = frame.fields.find((field) => field.name === arc.field);
           if (field && arc.color) {
             field.config = { ...field.config, color: { fixedColor: arc.color, mode: FieldColorModeId.Fixed } };
           }
