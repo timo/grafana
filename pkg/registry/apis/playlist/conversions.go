@@ -102,6 +102,20 @@ func convertToK8sResource(v *playlistsvc.PlaylistDTO, namespacer request.Namespa
 	return p
 }
 
+func copyLabels(orig, copy runtime.Object) (runtime.Object, error) {
+	accessorC, err := meta.Accessor(copy)
+	if err != nil {
+		return nil, err
+	}
+	accessorO, err := meta.Accessor(orig)
+	if err != nil {
+		return nil, err
+	}
+	accessorC.SetLabels(accessorO.GetLabels())
+
+	return copy, nil
+}
+
 func convertToLegacyUpdateCommand(p *playlist.Playlist, orgId int64) (*playlistsvc.UpdatePlaylistCommand, error) {
 	spec := p.Spec
 	cmd := &playlistsvc.UpdatePlaylistCommand{

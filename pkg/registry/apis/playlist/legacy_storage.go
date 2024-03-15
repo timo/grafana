@@ -122,7 +122,14 @@ func (s *legacyStorage) Create(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	return s.Get(ctx, out.UID, nil)
+
+	created, err := s.Get(ctx, out.UID, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// add labels to the legacy object for inclusion in entity store
+	return copyLabels(obj, created)
 }
 
 func (s *legacyStorage) Update(ctx context.Context,
@@ -163,7 +170,17 @@ func (s *legacyStorage) Update(ctx context.Context,
 	}
 
 	r, err := s.Get(ctx, name, nil)
-	return r, created, err
+	if err != nil {
+		return nil, created, err
+	}
+
+	// add labels to the legacy object for inclusion in entity store
+	withLabels, err := copyLabels(obj, r)
+	if err != nil {
+		return nil, created, err
+	}
+
+	return withLabels, created, err
 }
 
 // GracefulDeleter
